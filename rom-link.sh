@@ -190,46 +190,57 @@ load_config() {
 }
 
 # =============================================================================
-# Symlink a single file
+# Hardlink a single file
+# Hardlinks share the same inode — NFS clients see a plain file, no pointer
+# to follow. Requires both SRC and DEST to be on the same ZFS dataset.
 # =============================================================================
 link_file() {
   local SRC="$1"
   local DEST="$2"
-  local FILENAME
-  FILENAME=$(basename "$SRC")
 
-  # Real file exists (OS-managed) — do not overwrite
-  if [ -e "$DEST" ] && [ ! -L "$DEST" ]; then
-    verbose "SKIP (OS-managed): $DEST"
-    TOTAL_SKIPPED=$((TOTAL_SKIPPED + 1))
-    return
-  fi
+  # Real file exists — check if it's already a hardlink to SRC (same inode)
+  if [ -e "$DEST" ]; then
+    local SRC_INODE DEST_INODE
+    SRC_INODE=$(stat -c '%i' "$SRC" 2>/dev/null)
+    DEST_INODE=$(stat -c '%i' "$DEST" 2>/dev/null)
 
-  # Symlink already exists and points to correct target — no update needed
-  if [ -L "$DEST" ] && [ "$(readlink "$DEST")" = "$SRC" ]; then
-    verbose "SKIP (current): $DEST"
-    TOTAL_SKIPPED=$((TOTAL_SKIPPED + 1))
-    return
-  fi
-
-  # Symlink exists but points somewhere else — update it
-  if [ -L "$DEST" ]; then
-    if $DRY_RUN; then
-      dry "UPDATE link: $DEST -> $SRC"
+    if [ "$SRC_INODE" = "$DEST_INODE" ]; then
+      # Already correctly hardlinked — nothing to do
+      verbose "SKIP (current hardlink): $DEST"
+      TOTAL_SKIPPED=$((TOTAL_SKIPPED + 1))
+      return
     else
-      ln -sf "$SRC" "$DEST"
-      verbose "UPDATED: $DEST -> $SRC"
+      # File exists but is NOT a hardlink to SRC — could be OS-managed
+      # Only replace it if it's not a symlink (symlinks shouldn't be here
+      # after migration but handle gracefully)
+      if [ -L "$DEST" ]; then
+        # Stale symlink from a previous run — replace with hardlink
+        if $DRY_RUN; then
+          dry "REPLACE symlink with hardlink: $DEST => $SRC"
+        else
+          rm "$DEST"
+          ln "$SRC" "$DEST"
+          verbose "REPLACED symlink: $DEST => $SRC"
+        fi
+        TOTAL_UPDATED=$((TOTAL_UPDATED + 1))
+      else
+        # Real unrelated file (OS-managed e.g. _info.txt) — do not overwrite
+        verbose "SKIP (OS-managed): $DEST"
+        TOTAL_SKIPPED=$((TOTAL_SKIPPED + 1))
+      fi
+      return
     fi
-    TOTAL_UPDATED=$((TOTAL_UPDATED + 1))
-    return
   fi
 
-  # New link
+  # Destination does not exist — create new hardlink
   if $DRY_RUN; then
-    dry "LINK: $DEST -> $SRC"
+    dry "HARDLINK: $DEST => $SRC"
   else
-    ln -sf "$SRC" "$DEST"
-    verbose "LINKED: $DEST -> $SRC"
+    if ! ln "$SRC" "$DEST" 2>/dev/null; then
+      error "Failed to hardlink (cross-device?): $SRC => $DEST"
+      return 1
+    fi
+    verbose "HARDLINKED: $DEST => $SRC"
   fi
   TOTAL_LINKED=$((TOTAL_LINKED + 1))
 }
@@ -306,9 +317,13 @@ process_config() {
         link_recursive "$SRC" "$LINK_DIR"
         ;;
       dir)
-        info "[$DEST] Mode: dir (directory-level symlink)"
+        # Directories cannot be hardlinked — symlink is used here instead.
+        # For dir mode to work over NFS, ensure your NFS export covers the
+        # parent of both target_root and canonical_root so the symlink resolves
+        # within the export boundary.
+        info "[$DEST] Mode: dir (directory symlink — ensure NFS export covers parent)"
         if $DRY_RUN; then
-          dry "ln -sfn $SRC $LINK_DIR"
+          dry "ln -sfn \"$SRC\" \"$LINK_DIR\""
         else
           ln -sfn "$SRC" "$LINK_DIR"
         fi
